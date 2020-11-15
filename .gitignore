@@ -1,0 +1,13 @@
+.vs/
+.vscode/
+bin/
+obj/
+*.cod
+*.dll
+*.exe
+*.exp
+*.lib
+*.map
+*.obj
+*.res
+*.pdb
