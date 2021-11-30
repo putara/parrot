@@ -582,18 +582,18 @@ public:
     }
     ::CheckMenuRadioItem(hm, IDM_DEFAULT, IDM_LAST, idCheck, MF_BYCOMMAND);
   }
-  HIMAGELIST Load()
+  HIMAGELIST Load(UINT width, UINT height)
   {
-    extern HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, __in_bcount_opt(cbData) const void* data = NULL, DWORD cbData = 0);
+    extern HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, UINT iconWidth, UINT iconHeight, __in_bcount_opt(cbData) const void* data = NULL, DWORD cbData = 0);
     if (this->current_ != NULL) {
-      return ImageList_LoadAnimatedGif(this->current_->path);
+      return ImageList_LoadAnimatedGif(this->current_->path, width, height);
     }
     HRSRC hrsc = ::FindResourceW(HINST_THISCOMPONENT, MAKEINTRESOURCEW(IDR_MAIN), reinterpret_cast<LPCWSTR>(RT_RCDATA));
     if (hrsc != NULL) {
       DWORD cb = ::SizeofResource(HINST_THISCOMPONENT, hrsc);
       const void* data = static_cast<void*>(::LoadResource(HINST_THISCOMPONENT, hrsc));
       if (data != NULL) {
-        return ImageList_LoadAnimatedGif(NULL, data, cb);
+        return ImageList_LoadAnimatedGif(NULL, width, height, data, cb);
       }
     }
     return NULL;
@@ -749,7 +749,7 @@ struct CoInitialiser
 };
 
 
-HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, __in_bcount_opt(cbData) const void* data = NULL, DWORD cbData = 0)
+HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, UINT iconWidth, UINT iconHeight, __in_bcount_opt(cbData) const void* data = NULL, DWORD cbData = 0)
 {
 #define FAIL_BAIL if (FAILED(hr)) { return; } hr
   class Gif
@@ -832,14 +832,21 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, __in_bcount_opt(cbDa
       this->rect_ = rect;
       this->disposal_ = disposal;
     }
-    HBITMAP ToBitmap()
+    HBITMAP ToBitmap(UINT width, UINT height)
     {
+      if (width == 0 || height == 0 || height > UINT_MAX / 4 / width || height > INT_MAX) {
+        return NULL;
+      }
       if (this->bitmap_ == NULL) {
         return NULL;
       }
-      UINT width = 0, height = 0;
-      HRESULT hr = this->bitmap_->GetSize(&width, &height);
-      if (FAILED(hr) || width == 0 || height == 0 || height > UINT_MAX / 4 / width || height > INT_MAX) {
+      ComPtr<IWICBitmapScaler> scaler;
+      HRESULT hr = this->factory_->CreateBitmapScaler(&scaler);
+      if (FAILED(hr)) {
+        return NULL;
+      }
+      hr = scaler->Initialize(this->bitmap_, width, height, WICBitmapInterpolationModeFant);
+      if (FAILED(hr)) {
         return NULL;
       }
       void* bits = NULL;
@@ -848,7 +855,7 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, __in_bcount_opt(cbDa
       if (hbmp == NULL) {
         return NULL;
       }
-      hr = this->bitmap_->CopyPixels(NULL, width * 4, width * height * 4, static_cast<BYTE*>(bits));
+      hr = scaler->CopyPixels(NULL, width * 4, width * height * 4, static_cast<BYTE*>(bits));
       if (FAILED(hr)) {
         ::DeleteObject(hbmp);
         hbmp = NULL;
@@ -878,7 +885,7 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, __in_bcount_opt(cbDa
   reader.Release();
   FAIL_BAIL = decoder->GetFrameCount(&count);
   FAIL_BAIL = S_OK;
-  HIMAGELIST himl = ::ImageList_Create(width, height, ILC_COLOR32 | ILC_MASK, 0, 0);
+  HIMAGELIST himl = ::ImageList_Create(iconWidth, iconHeight, ILC_COLOR32 | ILC_MASK, 0, 0);
   if (himl == NULL) {
     return NULL;
   }
@@ -898,7 +905,7 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, __in_bcount_opt(cbDa
     FAIL_BAIL = PropVariant::ReadUInt8(reader, L"/grctlext/Disposal", &disposal);
     hr = S_OK;
     gif.Draw(frame, rect, disposal);
-    HBITMAP hbmp = gif.ToBitmap();
+    HBITMAP hbmp = gif.ToBitmap(iconWidth, iconHeight);
     if (hbmp != NULL) {
       ::ImageList_Replace(himl, i, hbmp, NULL);
       ::DeleteObject(hbmp);
@@ -919,6 +926,8 @@ private:
   Cue* cues_;
   HMENU hm_;
   HIMAGELIST himl_;
+  UINT (WINAPI* api_GetDpiForWindow_)(HWND);
+  int (WINAPI* api_GetSystemMetricsForDpi_)(int, UINT);
 
   static const UINT ID_MONITOR = 7133;
   static const UINT ID_ANIM = 4213;
@@ -945,9 +954,35 @@ private:
     return ret;
   }
 
+  bool GetIconSize(HWND hwnd, UINT* width, UINT* height)
+  {
+    int iconX = 0, iconY = 0;
+    if (this->api_GetDpiForWindow_ != NULL) {
+      // move to primary monitor
+      ::MoveWindow(hwnd, 0, 0, 0, 0, FALSE);
+      UINT dpi = this->api_GetDpiForWindow_(hwnd);
+      iconX = this->api_GetSystemMetricsForDpi_(SM_CXSMICON, dpi);
+      iconY = this->api_GetSystemMetricsForDpi_(SM_CYSMICON, dpi);
+    }
+    if (iconX <= 0 || iconY <= 0) {
+      iconX = ::GetSystemMetrics(SM_CXSMICON);
+      iconY = ::GetSystemMetrics(SM_CYSMICON);
+    }
+    if (0 < iconX && iconX <= INT_MAX && 0 < iconY && iconY <= INT_MAX) {
+      *width = iconX;
+      *height = iconY;
+      return true;
+    }
+    return false;
+  }
+
   bool Init(HWND hwnd)
   {
-    HIMAGELIST himl = this->list_.Load();
+    UINT width = 0, height = 0;
+    if (this->GetIconSize(hwnd, &width, &height) == false) {
+      return false;
+    }
+    HIMAGELIST himl = this->list_.Load(width, height);
     DWORD count = this->mon_.GetProcessorCount();
     this->cues_ = new Cue[count];
     bool ret = this->icons_.Init(hwnd, WM_USER_NOTIFY, count, himl != NULL ? himl : this->himl_);
@@ -968,6 +1003,7 @@ private:
     if (this->mon_.Init() == false) {
       return false;
     }
+    // FIXME: hard-coded 32x32
     HIMAGELIST himl = ::ImageList_Create(32, 32, ILC_COLOR32 | ILC_MASK, 1, 0);
     if (himl == NULL) {
       return false;
@@ -1115,6 +1151,15 @@ public:
     this->taskbarCreated_ = ::RegisterWindowMessageW(L"TaskbarCreated");
     if (this->taskbarCreated_ == 0) {
       this->taskbarCreated_ = ~0U;
+    }
+    HMODULE hmod = GetModuleHandleW(L"user32.dll");
+    this->api_GetDpiForWindow_ = NULL;
+    this->api_GetSystemMetricsForDpi_ = NULL;
+    FARPROC gdfw = GetProcAddress(hmod, "GetDpiForWindow");
+    FARPROC gsmfd = GetProcAddress(hmod, "GetSystemMetricsForDpi");
+    if (gdfw != NULL && gsmfd != NULL) {
+      reinterpret_cast<FARPROC&>(this->api_GetDpiForWindow_) = gdfw;
+      reinterpret_cast<FARPROC&>(this->api_GetSystemMetricsForDpi_) = gsmfd;
     }
   }
   ~NotifyIconWindow()
