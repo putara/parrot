@@ -975,12 +975,14 @@ private:
     ::ImageList_SetImageCount(himl, 1);
     ::ImageList_ReplaceIcon(himl, 0, LoadIconW(NULL, MAKEINTRESOURCEW(IDI_EXCLAMATION)));
     this->himl_ = himl;
-    ::SetTimer(hwnd, ID_MONITOR, 1000, NULL);
-    ::SetTimer(hwnd, ID_ANIM, 25, NULL);
     bool ret = this->Init(hwnd);
-    const UINT count = this->mon_.GetProcessorCount();
-    for (DWORD i = 0; i < count; i++) {
-      this->cues_[i].Schedule(Cue::DEFAULT);
+    if (ret) {
+      ::SetTimer(hwnd, ID_MONITOR, 1000, NULL);
+      ::SetTimer(hwnd, ID_ANIM, 25, NULL);
+      const UINT count = this->mon_.GetProcessorCount();
+      for (DWORD i = 0; i < count; i++) {
+        this->cues_[i].Schedule(Cue::DEFAULT);
+      }
     }
     return ret;
   }
