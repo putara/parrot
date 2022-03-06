@@ -751,16 +751,33 @@ struct CoInitialiser
 
 HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, UINT iconWidth, UINT iconHeight, __in_bcount_opt(cbData) const void* data = NULL, DWORD cbData = 0)
 {
-#define FAIL_BAIL if (FAILED(hr)) { return; } hr
+#define FAIL_BAIL if (FAILED(hr)) { return hr; } hr
   class Gif
   {
   private:
+    struct Buff
+    {
+      BYTE* p;
+      Buff()
+      {
+        this->p = NULL;
+      }
+      ~Buff()
+      {
+        ::free(this->p);
+      }
+      HRESULT Alloc(size_t cb)
+      {
+        this->p = static_cast<BYTE*>(::calloc(cb, 1));
+        return this->p != NULL ? S_OK : E_OUTOFMEMORY;
+      }
+    };
     ComPtr<IWICImagingFactory> factory_;
     ComPtr<IWICBitmap> bitmap_;
     ComPtr<IWICBitmap> saved_;
     WICRect rect_;
     UINT disposal_;
-    void Clear(const WICRect& rect)
+    HRESULT Clear(const WICRect& rect)
     {
       ComPtr<IWICBitmapLock> lock;
       HRESULT hr = S_OK;
@@ -778,34 +795,71 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, UINT iconWidth, UINT
         ::memset(data + offset, 0, width * 4);
         offset += stride;
       }
+      return hr;
     }
-    void Restore()
+    HRESULT Restore()
     {
       if (this->saved_ != NULL) {
         this->bitmap_.Release();
-        this->factory_->CreateBitmapFromSource(this->saved_, WICBitmapCacheOnDemand, &this->bitmap_);
+        return this->factory_->CreateBitmapFromSource(this->saved_, WICBitmapCacheOnDemand, &this->bitmap_);
       }
+      return S_OK;
     }
-    void Save()
+    HRESULT Save()
     {
       this->saved_.Release();
-      this->factory_->CreateBitmapFromSource(this->bitmap_, WICBitmapCacheOnDemand, &this->saved_);
+      return this->factory_->CreateBitmapFromSource(this->bitmap_, WICBitmapCacheOnDemand, &this->saved_);
     }
-    void CopyFrom(IWICBitmapFrameDecode* frame, const WICRect& rect)
+    HRESULT CopyFrom(IWICBitmapFrameDecode* frame, const WICRect& rect)
     {
       ComPtr<IWICFormatConverter> converter;
       ComPtr<IWICBitmapLock> lock;
       HRESULT hr = S_OK;
       FAIL_BAIL = this->factory_->CreateFormatConverter(&converter);
       FAIL_BAIL = converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0., WICBitmapPaletteTypeMedianCut);
-      FAIL_BAIL = this->bitmap_->Lock(&rect, WICBitmapLockWrite, &lock);
+      FAIL_BAIL = this->bitmap_->Lock(&rect, WICBitmapLockRead | WICBitmapLockWrite, &lock);
       UINT stride = 0;
       FAIL_BAIL = lock->GetStride(&stride);
       UINT cb = 0;
-      BYTE* data = NULL;
-      FAIL_BAIL = lock->GetDataPointer(&cb, &data);
-      FAIL_BAIL = converter->CopyPixels(NULL, stride, cb, data);
+      BYTE* destination = NULL;
+      FAIL_BAIL = lock->GetDataPointer(&cb, &destination);
+      Buff buff;
+      FAIL_BAIL = buff.Alloc(cb);
+      BYTE* source = buff.p;
+      FAIL_BAIL = converter->CopyPixels(NULL, stride, cb, source);
       FAIL_BAIL = S_OK;
+      const UINT skip = stride - rect.Width * 4;
+      UINT i = 0;
+      for (UINT y = rect.Height; y-- > 1; ) {
+        for (UINT x = rect.Width; x-- > 0; i += 4) {
+          if (source[i + 3] == 0) {
+            // do nothing
+          } else if (destination[i + 3] == 0 || source[i + 3] == 255) {
+            destination[i + 0] = source[i + 0];
+            destination[i + 1] = source[i + 1];
+            destination[i + 2] = source[i + 2];
+            destination[i + 3] = source[i + 3];
+          } else {
+            const BYTE srcA = source[i + 3];
+            const BYTE invA = 255 - srcA;
+            const BYTE dstA = destination[i + 3];
+            destination[i + 0] = Clamp(Div255(srcA * source[i + 0] + Div255(dstA * destination[i + 0] * invA)));
+            destination[i + 1] = Clamp(Div255(srcA * source[i + 1] + Div255(dstA * destination[i + 1] * invA)));
+            destination[i + 2] = Clamp(Div255(srcA * source[i + 2] + Div255(dstA * destination[i + 2] * invA)));
+            destination[i + 3] = Clamp(Div255(srcA + dstA * invA));
+          }
+        }
+        i += skip;
+      }
+      return hr;
+    }
+    static int Div255(int x)
+    {
+      return ((x + 1) * 257) >> 16;
+    }
+    static inline BYTE Clamp(int x)
+    {
+      return x < 0 ? 0 : (x > 255 ? 255 : static_cast<BYTE>(x));
     }
   public:
     Gif(IWICImagingFactory* factory, UINT width, UINT height)
@@ -815,52 +869,72 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, UINT iconWidth, UINT
       ::memset(&this->rect_, 0, sizeof(this->rect_));
       this->disposal_ = 0;
     }
-    void Draw(IWICBitmapFrameDecode* frame, const WICRect& rect, UINT disposal)
+    HRESULT Draw(IWICBitmapFrameDecode* frame, const WICRect& rect, UINT disposal)
     {
       if (this->bitmap_ == NULL) {
-        return;
+        return E_FAIL;
       }
+      HRESULT hr = S_OK;
       if (this->disposal_ == 2) {
-        this->Clear(this->rect_);
+        FAIL_BAIL = this->Clear(this->rect_);
       } else if (this->disposal_ == 3) {
-        this->Restore();
+        FAIL_BAIL = this->Restore();
       }
       if (disposal == 3) {
-        this->Save();
+        FAIL_BAIL = this->Save();
       }
-      this->CopyFrom(frame, rect);
+      FAIL_BAIL = this->CopyFrom(frame, rect);
+      FAIL_BAIL = S_OK;
       this->rect_ = rect;
       this->disposal_ = disposal;
+      return hr;
     }
-    HBITMAP ToBitmap(UINT width, UINT height)
+    HRESULT ToBitmap(UINT width, UINT height, HBITMAP* phbmpImage, HBITMAP* phbmpMask)
     {
+      *phbmpImage = NULL;
+      *phbmpMask = NULL;
       if (width == 0 || height == 0 || height > UINT_MAX / 4 / width || height > INT_MAX) {
-        return NULL;
+        return E_INVALIDARG;
       }
       if (this->bitmap_ == NULL) {
-        return NULL;
+        return E_FAIL;
       }
+#undef FAIL_BAIL
+#define FAIL_BAIL if (FAILED(hr)) { if (hbmp != NULL) ::DeleteObject(hbmp); return hr; } hr
       ComPtr<IWICBitmapScaler> scaler;
-      HRESULT hr = this->factory_->CreateBitmapScaler(&scaler);
-      if (FAILED(hr)) {
-        return NULL;
-      }
-      hr = scaler->Initialize(this->bitmap_, width, height, WICBitmapInterpolationModeFant);
-      if (FAILED(hr)) {
-        return NULL;
-      }
-      void* bits = NULL;
+      HBITMAP hbmp = NULL;
+      HRESULT hr = S_OK;
+      FAIL_BAIL = this->factory_->CreateBitmapScaler(&scaler);
+      FAIL_BAIL = scaler->Initialize(this->bitmap_, width, height, WICBitmapInterpolationModeFant);
+      BYTE* bits = NULL;
       BITMAPINFO hdr = { sizeof(BITMAPINFOHEADER), width, -static_cast<LONG>(height), 1, 32 };
-      HBITMAP hbmp = ::CreateDIBSection(NULL, &hdr, DIB_RGB_COLORS, &bits, NULL, 0);
-      if (hbmp == NULL) {
-        return NULL;
+      hbmp = ::CreateDIBSection(NULL, &hdr, DIB_RGB_COLORS, reinterpret_cast<void**>(&bits), NULL, 0);
+      FAIL_BAIL = hbmp != NULL ? S_OK : E_OUTOFMEMORY;
+      FAIL_BAIL = scaler->CopyPixels(NULL, width * 4, width * height * 4, bits);
+      Buff buff;
+      FAIL_BAIL = buff.Alloc((width + 7) / 8 * height);
+      BYTE* dst = buff.p;
+      const UINT padUp = -static_cast<int>((width + 7) / 8) & 1; // word aligned
+      for (UINT y = 0; y < height; y++) {
+        int maskbits = 0;
+        BYTE mask = 0;
+        for (UINT x = 0; x < width; x++) {
+          mask = (mask << 1) | (bits[3] ? 0 : 1);
+          bits += 4;
+          if (++maskbits >= 8) {
+            *dst++ = mask;
+            maskbits = 0;
+            mask = 0;
+          }
+        }
+        if (maskbits > 0) {
+          *dst = mask;
+        }
+        dst += padUp;
       }
-      hr = scaler->CopyPixels(NULL, width * 4, width * height * 4, static_cast<BYTE*>(bits));
-      if (FAILED(hr)) {
-        ::DeleteObject(hbmp);
-        hbmp = NULL;
-      }
-      return hbmp;
+      *phbmpImage = hbmp;
+      *phbmpMask = ::CreateBitmap(width, height, 1, 1, buff.p);
+      return hr;
     }
   };
 #undef FAIL_BAIL
@@ -903,13 +977,14 @@ HIMAGELIST ImageList_LoadAnimatedGif(__in_opt LPCWSTR path, UINT iconWidth, UINT
     FAIL_BAIL = PropVariant::ReadUInt16(reader, L"/imgdesc/Width", &rect.Width);
     FAIL_BAIL = PropVariant::ReadUInt16(reader, L"/imgdesc/Height", &rect.Height);
     FAIL_BAIL = PropVariant::ReadUInt8(reader, L"/grctlext/Disposal", &disposal);
-    hr = S_OK;
+    FAIL_BAIL = S_OK;
     gif.Draw(frame, rect, disposal);
-    HBITMAP hbmp = gif.ToBitmap(iconWidth, iconHeight);
-    if (hbmp != NULL) {
-      ::ImageList_Replace(himl, i, hbmp, NULL);
-      ::DeleteObject(hbmp);
-    }
+    HBITMAP hbmImage, hbmMask;
+    FAIL_BAIL = gif.ToBitmap(iconWidth, iconHeight, &hbmImage, &hbmMask);
+    FAIL_BAIL = S_OK;
+    ::ImageList_Replace(himl, i, hbmImage, hbmMask);
+    ::DeleteObject(hbmImage);
+    ::DeleteObject(hbmMask);
   }
 #undef FAIL_BAIL
   return himl;
