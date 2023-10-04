@@ -217,7 +217,7 @@ private:
     {
       WCHAR str[32];
       ::wnsprintfW(str, ARRAYSIZE(str), L"%u", cpu);
-      if (CreateGUIDV5(guid, str, static_cast<DWORD>(::wcslen(str)), &this->guidItem)) {
+      if (CreateGUIDV5(guid, str, static_cast<DWORD>(::wcslen(str) * sizeof(WCHAR)), &this->guidItem)) {
         this->uFlags |= NIF_GUID;
       } else {
         this->uID = cpu + 1;
